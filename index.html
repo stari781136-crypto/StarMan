@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <title>Royal Voice Engine</title>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-database-compat.js"></script>
+</head>
+<body style="background:transparent; margin:0; overflow:hidden;">
+    <div id="remote-audios"></div>
+    <script>
+        let database, myUid, localStream;
+        const peers = {};
+        const iceServers = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+        const audioConstraints = {
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                googHighpassFilter: true,
+                googNoiseSuppression: true,
+                googEchoCancellation: true,
+                googAutoGainControl: true
+            }
+        };
+
+        window.initVoice = function(configStr, uid) {
+            try {
+                firebase.initializeApp(JSON.parse(configStr));
+                database = firebase.database();
+                myUid = uid;
+                setupIncomingListener();
+                startLocalStream();
+            } catch(e) { if(window.AndroidBridge) AndroidBridge.log("Bridge Error: " + e.message); }
+        };
+
+        window.stopVoice = function() {
+            if (localStream) {
+                localStream.getTracks().forEach(t => t.stop());
+                localStream = null;
+            }
+            for (let id in peers) { peers[id].close(); delete peers[id]; }
+            document.getElementById('remote-audios').innerHTML = "";
+            if(window.AndroidBridge) AndroidBridge.log("Voice Stopped");
+        };
+
+        window.toggleMic = function(isMuted) {
+            if (localStream) {
+                localStream.getAudioTracks()[0].enabled = !isMuted;
+                if(window.AndroidBridge) AndroidBridge.log(isMuted ? "Mic Off" : "Mic On");
+            }
+        };
+
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+                if(window.AndroidBridge) AndroidBridge.log("Vocal Filter Active");
+            } catch (e) { if(window.AndroidBridge) AndroidBridge.log("Mic Permission Error"); }
+        }
+
+        function setupIncomingListener() {
+            database.ref(`voiceSignaling/${myUid}`).on('child_added', async (snap) => {
+                const data = snap.val();
+                if (data && data.type === 'offer') { handleOffer(data.offer, data.from); snap.ref.remove(); }
+            });
+        }
+
+        window.connectToUser = async function(remoteUid) {
+            if (peers[remoteUid]) return;
+            const pc = createPeerConnection(remoteUid);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            database.ref(`voiceSignaling/${remoteUid}`).push({ type: 'offer', from: myUid, offer: offer });
+        };
+
+        async function handleOffer(offer, remoteUid) {
+            const pc = createPeerConnection(remoteUid);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            database.ref(`voiceSignaling/${remoteUid}`).push({ type: 'answer', from: myUid, answer: answer });
+        }
+
+        function createPeerConnection(remoteUid) {
+            const pc = new RTCPeerConnection(iceServers);
+            peers[remoteUid] = pc;
+            if (localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            pc.ontrack = (e) => {
+                let a = document.createElement('audio'); a.autoplay = true; a.srcObject = e.streams[0];
+                document.getElementById('remote-audios').appendChild(a);
+            };
+            pc.onicecandidate = (e) => { if (e.candidate) database.ref(`voiceIce/${remoteUid}/${myUid}`).push(e.candidate.toJSON()); };
+            database.ref(`voiceIce/${myUid}/${remoteUid}`).on('child_added', s => pc.addIceCandidate(new RTCIceCandidate(s.val())));
+            database.ref(`voiceSignaling/${myUid}`).on('child_added', async (s) => {
+                const d = s.val(); if (d && d.type === 'answer' && d.from === remoteUid) {
+                    await pc.setRemoteDescription(new RTCSessionDescription(d.answer)); s.ref.remove();
+                }
+            });
+            return pc;
+        }
+    </script>
+</body>
+</html>
+
