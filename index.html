@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redzone Pro Voice</title>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-database-compat.js"></script>
+    <style>
+        body { background: transparent; color: #2ea043; font-family: sans-serif; margin: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; }
+        #container { text-align: center; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; border: 1px solid #2ea043; }
+        #status { font-size: 12px; font-weight: bold; margin-bottom: 8px; text-transform: uppercase; }
+        #unlock-btn { 
+            background: #2ea043; color: white; border: none; padding: 10px 20px; 
+            border-radius: 5px; font-weight: bold; cursor: pointer; display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="status">Connecting...</div>
+        <button id="unlock-btn" onclick="manualUnlock()">JOIN VOICE ROOM</button>
+    </div>
+    <div id="remote-audios"></div>
+
+    <script>
+        let database, myUid, localStream;
+        const peers = {};
+        const pendingCandidates = {}; // Candidate buffer
+        
+        const iceServers = { 
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:stun1.l.google.com:19302" },
+                { urls: "stun:stun2.l.google.com:19302" }
+            ] 
+        };
+
+        function report(msg) {
+            if(window.AndroidBridge) window.AndroidBridge.log(msg);
+            document.getElementById('status').innerText = msg;
+        }
+
+        async function manualUnlock() {
+            try {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                const ctx = new AudioContext();
+                if (ctx.state === 'suspended') await ctx.resume();
+                
+                document.getElementById('unlock-btn').style.display = 'none';
+                report("VOICE ACTIVE");
+                
+                document.querySelectorAll('audio').forEach(a => {
+                    a.play().catch(e => console.log("Force play failed", e));
+                });
+            } catch(e) { report("Error: " + e.message); }
+        }
+
+        window.initVoice = async function(configStr, uid) {
+            try {
+                if (!firebase.apps.length) firebase.initializeApp(JSON.parse(configStr));
+                database = firebase.database();
+                myUid = uid;
+                
+                localStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        echoCancellation: true, 
+                        noiseSuppression: true,
+                        autoGainControl: true 
+                    } 
+                });
+                
+                report("MIC READY - TAP JOIN");
+                document.getElementById('unlock-btn').style.display = 'block';
+                setupSignalingListener();
+            } catch(e) { report("Mic Error: " + e.message); }
+        };
+
+        function setupSignalingListener() {
+            database.ref(`voiceSignaling/${myUid}`).on('child_added', async (snap) => {
+                const data = snap.val();
+                if (!data) return;
+                const remoteUid = data.from;
+
+                if (!peers[remoteUid] && data.type === 'offer') {
+                    createPeerConnection(remoteUid);
+                }
+
+                const pc = peers[remoteUid];
+                if (!pc) return;
+
+                try {
+                    if (data.type === 'offer') {
+                        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                        const answer = await pc.createAnswer();
+                        await pc.setLocalDescription(answer);
+                        database.ref(`voiceSignaling/${remoteUid}`).push({ type: 'answer', from: myUid, answer: answer });
+                        
+                        // Process queued candidates
+                        if (pendingCandidates[remoteUid]) {
+                            pendingCandidates[remoteUid].forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)));
+                            delete pendingCandidates[remoteUid];
+                        }
+                    } else if (data.type === 'answer') {
+                        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                        if (pendingCandidates[remoteUid]) {
+                            pendingCandidates[remoteUid].forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)));
+                            delete pendingCandidates[remoteUid];
+                        }
+                    } else if (data.type === 'candidate') {
+                        const cand = new RTCIceCandidate(data.candidate);
+                        if (pc.remoteDescription && pc.remoteDescription.type) {
+                            await pc.addIceCandidate(cand);
+                        } else {
+                            if (!pendingCandidates[remoteUid]) pendingCandidates[remoteUid] = [];
+                            pendingCandidates[remoteUid].push(cand);
+                        }
+                    }
+                } catch(e) { console.error("Signaling Error", e); }
+                snap.ref.remove(); 
+            });
+        }
+
+        window.connectToUser = async function(remoteUid) {
+            if (peers[remoteUid]) return;
+            const pc = createPeerConnection(remoteUid);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            database.ref(`voiceSignaling/${remoteUid}`).push({ type: 'offer', from: myUid, offer: offer });
+        };
+
+        function createPeerConnection(remoteUid) {
+            const pc = new RTCPeerConnection(iceServers);
+            peers[remoteUid] = pc;
+
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                    database.ref(`voiceSignaling/${remoteUid}`).push({ 
+                        type: 'candidate', from: myUid, candidate: e.candidate.toJSON() 
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                if(pc.connectionState === 'connected') report("USER CONNECTED");
+                if(pc.connectionState === 'failed') report("RETRYING...");
+            };
+
+            pc.ontrack = (e) => {
+                let a = document.getElementById('audio_' + remoteUid);
+                if (!a) {
+                    a = document.createElement('audio');
+                    a.id = 'audio_' + remoteUid;
+                    a.autoplay = true;
+                    a.controls = false;
+                    a.setAttribute('playsinline', 'true');
+                    document.getElementById('remote-audios').appendChild(a);
+                }
+                a.srcObject = e.streams[0];
+                a.play().catch(() => {
+                    report("TAP JOIN TO HEAR");
+                    document.getElementById('unlock-btn').style.display = 'block';
+                });
+            };
+
+            return pc;
+        }
+
+        window.removeUser = function(uid) {
+            if (peers[uid]) {
+                peers[uid].close();
+                delete peers[uid];
+                const a = document.getElementById('audio_' + uid);
+                if (a) a.remove();
+                report("USER LEFT");
+            }
+        };
+    </script>
+</body>
+</html>
+
